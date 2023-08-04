@@ -1,0 +1,128 @@
+---
+title: "Bioregions map"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)  # Data wrangling
+library(here)       # Safe paths
+library(sf)         # Spatial features
+library(ggplot2)
+library(sp)
+library(maps)
+library(maptools)
+```
+
+#you'll need to get these points from the link i provided above. this code just removes the non-endemics from the points data
+```{r}
+points <-read.csv("locations_endemic_genera_v2.csv")
+
+all <- read_csv('intermediate_data/all_gen_with_status.csv')
+
+all <- left_join(all, points %>% select(genus, current_knowledge), by = "genus")
+non_end <- all %>% 
+  subset(current_knowledge == 'non-endemic')
+
+end <- all %>% 
+  subset(current_knowledge == 'endemic')
+
+points <- points[!points$genus %in% non_end$genus, ]
+
+points$current_knowledge <- 'endemic'
+```
+
+#download IBRA bioregions
+```{r}
+install.packages("remotes")
+remotes::install_github("johnbaums/things")
+
+bioregions <- things::ibra7_albers
+
+crs_4326 <- CRS("+init=EPSG:4326")
+bioregions <- spTransform(bioregions, crs_4326)
+```
+
+#convert to sf
+```{r}
+bioregions_df <- st_as_sf(bioregions)
+species_points_sf <- points %>% 
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), 
+           crs = st_crs(4326))
+```
+
+#join occurence with bioregions
+```{r}
+species_bioregion_sf <- st_join(species_points_sf, bioregions_df, join = st_within)
+```
+
+#get only unique species per bioregion so it gives richness instead of occurence - reduces bias from more occurence data in populated areas (i hope lol)
+```{r}
+unique_genera_bioregion_sf <- species_bioregion_sf %>%
+  distinct(REG_NAME_7, genus, .keep_all = TRUE)  # .keep_all = TRUE ensures all columns are kept
+
+genera_counts_per_bioregion <- unique_genera_bioregion_sf %>%
+  group_by(REG_NAME_7) %>%
+  summarise(genera_count = n(), REG_NAME_7 = first(REG_NAME_7))
+
+IBRA_grid_bio_gen <- merged_sf %>%
+  as_tibble() %>%
+  mutate(id = REG_NAME_7) %>%
+  full_join(genera_counts_per_bioregion,
+            by = join_by(id == REG_NAME_7)) %>%
+  st_as_sf()
+
+IBRA_grid_bio_gen$area <- NA
+
+IBRA_grid_bio_gen$area <- st_area(IBRA_grid_bio_gen[1])
+
+IBRA_grid_bio_gen$prop_count <- IBRA_grid_bio_gen$genera_count/IBRA_grid_bio_gen$area
+
+# Removing the "[1/m²]" unit from 'prop_count' column
+IBRA_grid_bio_gen$prop_count <- gsub("\\s*\\[1/m²\\]", "", IBRA_grid_bio_gen$prop_count)
+
+# Convert 'prop_count' to numeric (if it's currently stored as character)
+IBRA_grid_bio_gen$prop_count <- as.numeric(IBRA_grid_bio_gen$prop_count)
+
+#to produce density/km2
+IBRA_grid_bio_gen$prop_count <- IBRA_grid_bio_gen$prop_count * 1000000
+```
+
+#Plot
+```{r}
+bio_gen_count <- ggplot() +
+  geom_sf(data = IBRA_grid_bio_gen, aes(fill = genera_count), size = .01) +
+  scale_fill_gradientn(colours = c("orange", "blue"), 
+                       na.value = "white", 
+                       labels = scales::comma_format(),
+                       n.breaks = 6,
+                       guide = guide_colourbar(title = "endemic genera")) +
+  coord_sf(ylim = c(-45, -10), 
+           xlim = c(110, 155)) +
+  labs(x = 'longtiude', y = 'latitude') +
+  theme_bw() 
+
+bio_gen_count
+
+ggsave('bio_gen_count.png', plot = bio_gen_count)
+
+bioregion_prop_gen <- ggplot() +
+  geom_sf(data = IBRA_grid_bio_gen, aes(fill = prop_count), size = .01) +
+  scale_fill_gradientn(
+    colours = c("orange", "blue"),
+    na.value = "white",
+    trans = "log10",
+    labels = scales::comma_format(),
+    n.breaks = 6,
+    guide = guide_colourbar(title = "endemic genera \nper km²")
+  ) +
+  coord_sf(ylim = c(-45, -10), 
+           xlim = c(110, 155)) +
+  labs(x = 'longitude', y = 'latitude') +
+  theme_bw()
+
+bioregion_prop_gen
+
+ggsave('bioregion_prop_gen.png', plot = bioregion_prop_gen)
+```
+
